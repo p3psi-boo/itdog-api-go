@@ -214,3 +214,13 @@ func TestCaptchaTokenGuard(t *testing.T) {
 		t.Fatalf("未配置令牌时应放行，got %d", w.Code)
 	}
 }
+
+func TestHealthz(t *testing.T) {
+	g := newTestRouter(&mockService{})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	g.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "ok" {
+		t.Fatalf("healthz 应返回 200 ok，got %d %q", w.Code, w.Body.String())
+	}
+}

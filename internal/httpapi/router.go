@@ -43,6 +43,10 @@ func NewRouter(svc service) *gin.Engine {
 	g.NoMethod(func(c *gin.Context) { fail(c, http.StatusMethodNotAllowed, "Method Not Allowed") })
 
 	api := &API{svc: svc, captchaToken: os.Getenv("ITDOG_CAPTCHA_TOKEN")}
+	// 健康检查（无鉴权，供容器/LB 探活）
+	g.GET("/healthz", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
 	it := g.Group("/it")
 	it.GET("/ping", api.ping)
 	it.GET("/tcping", api.tcping)
