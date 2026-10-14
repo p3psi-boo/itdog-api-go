@@ -38,3 +38,7 @@ dist/
 
 # GOPATH
 .gopath/
+data/
+server
+*.exe
+.pi/

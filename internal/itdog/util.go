@@ -2,12 +2,10 @@ package itdog
 
 import (
 	"crypto/md5"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
 )
 
 var provinceData = map[int]string{
@@ -72,49 +70,12 @@ var regionData = map[int]string{
 	14: "大洋洲",
 }
 
+// getToken 计算 WebSocket URL 中的 token：
+// md5(task_id + salt) 十六进制串的第 8..24 位（md5.js 中 md5(x, 16) 的行为）。
 func getToken(taskID string) string {
-	h := md5.Sum([]byte(taskID + "token_20230313000136kwyktxb0tgspm00yo5"))
+	h := md5.Sum([]byte(taskID + taskTokenSalt))
 	s := hex.EncodeToString(h[:])
 	return s[8:24]
-}
-
-func getGuardRet(guard string) string {
-	if len(guard) < 13 {
-		return ""
-	}
-	prefix := guard[:8]
-	num, err := strconv.Atoi(guard[12:])
-	if err != nil {
-		return ""
-	}
-	calc := strconv.Itoa(num*2 + 16)
-	xored := guardXOREncrypt(calc, prefix)
-	return base64.StdEncoding.EncodeToString([]byte(xored))
-}
-
-func guardXOREncrypt(input, key string) string {
-	key += "PTNo2n3Ev5"
-	out := make([]byte, len(input))
-	for i := 0; i < len(input); i++ {
-		out[i] = input[i] ^ key[i%len(key)]
-	}
-	return string(out)
-}
-
-func parseSetCookies(cookies []string) map[string]string {
-	out := make(map[string]string)
-	for _, v := range cookies {
-		parts := strings.Split(v, ";")
-		if len(parts) == 0 {
-			continue
-		}
-		kv := strings.SplitN(parts[0], "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		out[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-	}
-	return out
 }
 
 func getStatisticians(entries []StatEntry) map[string]any {

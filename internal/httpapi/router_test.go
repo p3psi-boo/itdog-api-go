@@ -18,22 +18,23 @@ type mockService struct {
 	tcpingResp map[string]any
 	httpResp   map[string]any
 	dnsResp    map[string]any
+	err        error
 }
 
-func (m *mockService) Ping(ctx context.Context, host string) map[string]any {
-	return m.pingResp
+func (m *mockService) Ping(ctx context.Context, host string) (map[string]any, error) {
+	return m.pingResp, m.err
 }
 
-func (m *mockService) TCPing(ctx context.Context, host string, port int) map[string]any {
-	return m.tcpingResp
+func (m *mockService) TCPing(ctx context.Context, host string, port int) (map[string]any, error) {
+	return m.tcpingResp, m.err
 }
 
-func (m *mockService) HTTP(ctx context.Context, opt itdog.HTTPOptions) map[string]any {
-	return m.httpResp
+func (m *mockService) HTTP(ctx context.Context, opt itdog.HTTPOptions) (map[string]any, error) {
+	return m.httpResp, m.err
 }
 
-func (m *mockService) DNS(ctx context.Context, domain, dnsType, server string) map[string]any {
-	return m.dnsResp
+func (m *mockService) DNS(ctx context.Context, domain, dnsType, server string) (map[string]any, error) {
+	return m.dnsResp, m.err
 }
 
 func TestPingMissingHost(t *testing.T) {
@@ -200,5 +201,16 @@ func mustHas(t *testing.T, data map[string]any, key string) {
 	t.Helper()
 	if _, ok := data[key]; !ok {
 		t.Fatalf("expected key %q in data", key)
+	}
+}
+
+func TestCaptchaTokenGuard(t *testing.T) {
+	g := newTestRouter(&mockService{})
+	// 未配置令牌时不限制
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/it/captcha/status", nil)
+	g.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("未配置令牌时应放行，got %d", w.Code)
 	}
 }

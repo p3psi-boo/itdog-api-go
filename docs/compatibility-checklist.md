@@ -1,66 +1,36 @@
-# itdog-api Golang 兼容性核对清单
+# 上游兼容性核对清单（2026-10-14 实测复核）
 
-对照基准：`refs/itdog-api`（NestJS 版本）
+## 任务创建
 
-## 全局行为
+- [x] `POST /ping/{host}`：表单 `line=&button_click=yes&dns_server_type=isp&dns_server=`；HTML 含 `var task_id='...'`
+- [x] `POST /tcping/{host}:{port}`：同 ping 表单
+- [x] `POST /http/`：完整表单（host/host_s/check_mode/http_version/ipv4/method/referer/ua/cookies/redirect_num/dns_server_type/dns_server/line）
+- [x] `POST /dns/{domain}`：`dns_type/dns_server_type=custom/dns_server/line`
+- [x] 未验证会话的任务 POST 一律返回验证页（全端点强制，实测确认）
 
-| 项目 | 参考实现 | Go 实现 | 结论 |
-|---|---|---|---|
-| 基础前缀 | `/it` | `/it` | 一致 |
-| 成功响应包装 | `{code:200,timestamp,data}` | `{code:200,timestamp,data}` | 一致 |
-| 异常响应包装 | HTTP 200 + `{code,message,timestamp}` | HTTP 200 + `{code,message,timestamp}` | 一致 |
-| 请求日志 | `[METHOD] originalUrl - ua` | `[METHOD] URL - ua` | 基本一致 |
-| 端口配置 | `HTTP_PORT`，默认 `3000` | `HTTP_PORT`，默认 `3000` | 一致 |
+## WebSocket 结果通道
 
-## 接口级字段核对
+- [x] URL：`wss://www.itdog.cn/websockets/{task_id}/{token}`
+- [x] token：`md5(task_id + "What this is is no longer important.")` hex 的 `[8:24]`（实测样本回归测试 `TestGetToken`）
+- [x] 握手后发送 `{"task_id":"..."}`；收到 `type=finished` 结束
+- [x] 消息字段映射：
+  - ping/tcping：`ip/result/name/address/node_id/line/region/province`
+  - http：`http_code/all_time/dns_time/connect_time/download_time/redirect/redirect_time/head`（注意：无 ssl_time，是 download_time）
+  - dns：`time/result[]/host`
+- [x] `type=node_error` → 监测点异常（计入超时统计）
+- [x] 解析失败（非 IP）节点：js 显示"解析失败"，本服务 result 值为 null/0 归入超时
 
-### `GET /it/ping`
+## 人机验证（上游 2026-10 新增）
 
-| 维度 | 参考实现 | Go 实现 | 结论 |
-|---|---|---|---|
-| 入参 | `host`（必填，IPv4 或可解析域名） | 同 | 一致 |
-| 错误文案 | `不正确的主机名或IPV4地址！` | 同 | 一致 |
-| 结果字段 | `ip, delay, node, address` | 同 | 一致 |
-| 统计字段 | `total` 来自 `getStatisticians` | 同源迁移 | 一致 |
+- [x] 预检 `GET /verify/clicaptcha.php?type=ajax`：`{type: verify|success, img}`
+- [x] 提交 `POST ?type=tool`：`do=check&info={x,y}-{x,y};{w};{h};{base64 payload}`
+- [x] base64 轨迹 payload 仅弱校验（伪造 v2 格式实测通过）
+- [x] 校验为包围盒命中（源自开源 hooray/clicaptcha-server，itdog 魔改删除了答案 cookie 泄漏）
+- [x] 验证状态绑定 PHPSESSID；`user_token` 恒为 delete（死代码）；`bot_verify_limited` 连续失败会触发（实现退避）
+- [x] 会话持久化 + keepalive 后不再触发验证
 
-### `GET /it/tcping`
+## 已移除的旧协议（本服务不再实现）
 
-| 维度 | 参考实现 | Go 实现 | 结论 |
-|---|---|---|---|
-| 入参 | `host` + `port`（1..65535） | 同 | 一致 |
-| 错误文案 | host/port 文案固定中文 | 同 | 一致 |
-| 结果字段 | `ip, delay, node, address, port` | 同 | 一致 |
-| 统计字段 | `total` 来自 `getStatisticians` | 同源迁移 | 一致 |
-
-### `POST /it/http`
-
-| 维度 | 参考实现 | Go 实现 | 结论 |
-|---|---|---|---|
-| 入参 | body: `url` 必填，`method` 可选（仅校验 `get/post`） | body: `url` 必填，`method` 可选（仅校验 `get/post`） | 一致 |
-| 错误文案 | `无效的请求链接！` / `无效的请求方式！` | 同 | 一致 |
-| 上游构造 | 固定补充 `check_mode=fast, host=url, host_s=uri.host` | 同 | 一致 |
-| 结果字段 | `address,node,ip,http_code,redirect_time,redirect,ssl_time,dns_time,connect_time,all_time,head` | 同 | 一致 |
-| 统计延迟键 | `all_time` | `all_time` | 一致 |
-
-### `GET /it/dns`
-
-| 维度 | 参考实现 | Go 实现 | 结论 |
-|---|---|---|---|
-| 入参 | `domain`,`type`,`server`（默认 `223.5.5.5`） | 同 | 一致 |
-| `type` 白名单 | `a,cname,mx,aaaa,ns,txt,ptr,srv` | 同 | 一致 |
-| 错误文案 | `无效的解析类型！` | 同 | 一致 |
-| 结果字段 | `node, delay, result`；失败时 `delay=-1ms` | 同 | 一致 |
-| 统计延迟键 | `time` | `time` | 一致 |
-
-## 上游交互核对（itdog.cn）
-
-| 维度 | 参考实现 | Go 实现 | 结论 |
-|---|---|---|---|
-| 任务创建 | POST 表单并正则提取 `task_id` | 同 | 一致 |
-| 反爬处理 | `guard/guardret` + cookie 刷新重试 | 同 | 一致 |
-| websocket 地址 | `wss://www.itdog.cn/websockets` | 同 | 一致 |
-| token 规则 | `md5(task_id+salt).slice(8,24)` | 同 | 一致 |
-
-## 当前待修正项
-
-无。
+- guard/guardret 反爬（`_guard` cookie + XOR 算法）：上游已下线
+- 旧 task_token salt `token_20230313000136kwyktxb0tgspm00yo5`：已更换
+- 旧 WebSocket 握手协议（发送 `{"task_id","token"}`）：现为 URL 携带 token
