@@ -1,12 +1,16 @@
 package itdog
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/jpeg"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGetToken(t *testing.T) {
@@ -178,5 +182,124 @@ func TestVisionUnlimitedNeverFallsBack(t *testing.T) {
 	}
 	if got := s.Name(); got != "vision(8/∞)" {
 		t.Fatalf("Name() = %q", got)
+	}
+}
+
+func TestVisionBudgetCountsReturnedCoordinatesAndResets(t *testing.T) {
+	vision := &fakeSolver{name: "vision", pts: [][2]int{{1, 1}, {2, 2}}}
+	manual := &fakeSolver{name: "manual", pts: [][2]int{{3, 3}, {4, 4}}}
+	s := NewVisionFallbackSolver(vision, manual, 2)
+	for i := 0; i < 3; i++ {
+		if _, err := s.Solve(context.Background(), CaptchaChallenge{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if vision.calls != 2 || manual.calls != 1 {
+		t.Fatalf("vision=%d manual=%d", vision.calls, manual.calls)
+	}
+	s.Reset()
+	if s.ManualPhase() {
+		t.Fatal("manual phase survived reset")
+	}
+	_, err := s.Solve(context.Background(), CaptchaChallenge{})
+	if err != nil || vision.calls != 3 {
+		t.Fatalf("new cycle: vision=%d err=%v", vision.calls, err)
+	}
+}
+
+func TestBrokerLifecycleAndValidation(t *testing.T) {
+	b := NewCaptchaBroker()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Publish(ctx, CaptchaChallenge{Image: []byte{1, 2}, Width: 20, Height: 20})
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	var version int64
+	for {
+		_, v, ok := b.Pending()
+		if ok {
+			version = v
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("challenge not published")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := b.Publish(ctx, CaptchaChallenge{}); err == nil {
+		t.Fatal("overlapping challenge accepted")
+	}
+	valid := CaptchaSolution{Points: [][2]int{{1, 1}, {2, 2}}}
+	for _, v := range []int64{0, version + 1} {
+		if err := b.Submit(valid, v); !errors.Is(err, ErrChallengeRefreshed) {
+			t.Fatalf("version %d: %v", v, err)
+		}
+	}
+	if err := b.Submit(CaptchaSolution{Points: [][2]int{{-1, 1}, {2, 2}}}, version); err == nil {
+		t.Fatal("invalid coordinates accepted")
+	}
+	if err := b.Submit(valid, version); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Submit(valid, version); err == nil {
+		t.Fatal("duplicate answer accepted")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := b.Pending(); ok {
+		t.Fatal("resolved challenge still pending")
+	}
+	go func() { _, err := b.Publish(ctx, CaptchaChallenge{Width: 20, Height: 20}); done <- err }()
+	deadline = time.Now().Add(time.Second)
+	for {
+		_, v, ok := b.Pending()
+		if ok {
+			if v <= version {
+				t.Fatal("version not monotonic")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("next challenge not published")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if _, _, ok := b.Pending(); ok {
+		t.Fatal("canceled challenge still pending")
+	}
+}
+
+func TestManualSolverTimeout(t *testing.T) {
+	b := NewCaptchaBroker()
+	s := ManualSolver{Broker: b, WaitLimit: 10 * time.Millisecond}
+	if _, err := s.Solve(context.Background(), CaptchaChallenge{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if _, _, ok := b.Pending(); ok {
+		t.Fatal("challenge leaked")
+	}
+}
+
+func TestDecodeCaptchaImageValidation(t *testing.T) {
+	for _, raw := range []string{"bad", "data:image/jpeg;base64,!!!", "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("not JPEG"))} {
+		if _, _, _, err := decodeCaptchaImage(raw); err == nil {
+			t.Fatalf("accepted %s", raw)
+		}
+	}
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 20, 30)), nil); err != nil {
+		t.Fatal(err)
+	}
+	_, w, h, err := decodeCaptchaImage("data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(encoded.Bytes()))
+	if err != nil || w != 20 || h != 30 {
+		t.Fatalf("%d %d %v", w, h, err)
 	}
 }

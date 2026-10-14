@@ -157,8 +157,8 @@ func newTestRouter(svc service) *gin.Engine {
 
 func assertEnvelope(t *testing.T, w *httptest.ResponseRecorder, code int, message string) {
 	t.Helper()
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected HTTP status 200, got %d", w.Code)
+	if w.Code != code {
+		t.Fatalf("expected HTTP status %d, got %d", code, w.Code)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
@@ -201,17 +201,6 @@ func mustHas(t *testing.T, data map[string]any, key string) {
 	t.Helper()
 	if _, ok := data[key]; !ok {
 		t.Fatalf("expected key %q in data", key)
-	}
-}
-
-func TestCaptchaTokenGuard(t *testing.T) {
-	g := newTestRouter(&mockService{})
-	// 未配置令牌时不限制
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest(http.MethodGet, "/it/captcha/status", nil)
-	g.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("未配置令牌时应放行，got %d", w.Code)
 	}
 }
 

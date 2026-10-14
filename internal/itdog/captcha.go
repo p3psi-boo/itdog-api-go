@@ -7,8 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
+	"image/jpeg"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -44,15 +43,17 @@ type CaptchaSolver interface {
 type pendingChallenge struct {
 	ch      CaptchaChallenge
 	created time.Time
-	version int64 // 发布时间戳（毫秒），用于防止把旧答案提交到新挑战
+	version int64 // 当前进程内单调递增，用于防止把旧答案提交到新挑战
 }
 
 // CaptchaBroker 持有待解决的验证码挑战，供人工通过 HTTP API 处理。
 type CaptchaBroker struct {
-	mu       sync.Mutex
-	pending  *pendingChallenge
-	solCh    chan CaptchaSolution
-	resolved int
+	mu        sync.Mutex
+	pending   *pendingChallenge
+	solCh     chan CaptchaSolution
+	resolved  int
+	version   int64
+	submitted bool
 }
 
 func NewCaptchaBroker() *CaptchaBroker {
@@ -61,8 +62,18 @@ func NewCaptchaBroker() *CaptchaBroker {
 
 // Publish 发布挑战并阻塞等待答案（或 ctx 取消）。
 func (b *CaptchaBroker) Publish(ctx context.Context, ch CaptchaChallenge) (CaptchaSolution, error) {
+	if err := ctx.Err(); err != nil {
+		return CaptchaSolution{}, err
+	}
 	b.mu.Lock()
-	b.pending = &pendingChallenge{ch: ch, created: time.Now(), version: time.Now().UnixMilli()}
+	if b.pending != nil {
+		b.mu.Unlock()
+		return CaptchaSolution{}, errors.New("已有待处理的验证码")
+	}
+	b.version = max(b.version+1, time.Now().UnixMilli())
+	ch.Image = append([]byte(nil), ch.Image...)
+	b.pending = &pendingChallenge{ch: ch, created: time.Now(), version: b.version}
+	b.submitted = false
 	b.solCh = make(chan CaptchaSolution, 1)
 	solCh := b.solCh
 	b.mu.Unlock()
@@ -70,6 +81,7 @@ func (b *CaptchaBroker) Publish(ctx context.Context, ch CaptchaChallenge) (Captc
 	defer func() {
 		b.mu.Lock()
 		b.pending = nil
+		b.solCh = nil
 		b.mu.Unlock()
 	}()
 
@@ -91,7 +103,9 @@ func (b *CaptchaBroker) Pending() (CaptchaChallenge, int64, bool) {
 	if b.pending == nil {
 		return CaptchaChallenge{}, 0, false
 	}
-	return b.pending.ch, b.pending.version, true
+	ch := b.pending.ch
+	ch.Image = append([]byte(nil), ch.Image...)
+	return ch, b.pending.version, true
 }
 
 // Submit 提交人工答案；version 不匹配说明挑战已刷新。
@@ -101,15 +115,25 @@ func (b *CaptchaBroker) Submit(sol CaptchaSolution, version int64) error {
 	if b.pending == nil {
 		return errors.New("当前没有需要处理的验证码")
 	}
-	if version != 0 && version != b.pending.version {
+	if version != b.pending.version {
 		return errChallengeRefreshed
 	}
 	if len(sol.Points) != 2 {
 		return errors.New("需要两个点击坐标")
 	}
+	for _, p := range sol.Points {
+		if p[0] < 0 || p[0] >= b.pending.ch.Width || p[1] < 0 || p[1] >= b.pending.ch.Height {
+			return errors.New("坐标超出图片范围")
+		}
+	}
+	if b.submitted {
+		return errors.New("验证码答案已在处理中")
+	}
+	sol.Points = append([][2]int(nil), sol.Points...)
 	select {
 	case b.solCh <- sol:
 		b.resolved++
+		b.submitted = true
 		return nil
 	default:
 		return errors.New("验证码答案已在处理中")
@@ -199,9 +223,9 @@ func (v *VisionSolver) Solve(ctx context.Context, ch CaptchaChallenge) (CaptchaS
 		return CaptchaSolution{}, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return CaptchaSolution{}, fmt.Errorf("vision API 返回 %d: %s", resp.StatusCode, truncate(string(data), 200))
+	data, err := readResponse(resp, 1<<20)
+	if err != nil {
+		return CaptchaSolution{}, fmt.Errorf("vision API: %w", err)
 	}
 
 	var parsed struct {
@@ -271,6 +295,9 @@ func (c *ChainSolver) Name() string {
 func (c *ChainSolver) Solve(ctx context.Context, ch CaptchaChallenge) (CaptchaSolution, error) {
 	var errs []string
 	for _, s := range c.Solvers {
+		if err := ctx.Err(); err != nil {
+			return CaptchaSolution{}, err
+		}
 		sol, err := s.Solve(ctx, ch)
 		if err == nil {
 			return sol, nil
@@ -283,11 +310,6 @@ func (c *ChainSolver) Solve(ctx context.Context, ch CaptchaChallenge) (CaptchaSo
 // ---------------------------------------------------------------------------
 // 验证码协议：获取挑战 / 提交答案
 // ---------------------------------------------------------------------------
-
-const (
-	captchaPrecheckURL = baseURL + "/verify/clicaptcha.php?type=ajax"
-	captchaCheckURL    = baseURL + "/verify/clicaptcha.php?type=tool"
-)
 
 type captchaStatus struct {
 	Type string `json:"type"` // success / verify / error
@@ -348,31 +370,19 @@ func decodeCaptchaImage(imgData string) ([]byte, int, int, error) {
 		return nil, 0, 0, err
 	}
 	w, h := jpegSize(raw)
+	if w <= 0 || h <= 0 {
+		return nil, 0, 0, errors.New("无效的 JPEG 验证码图片")
+	}
 	return raw, w, h, nil
 }
 
-// jpegSize 从 JPEG SOF 段读取尺寸。
+// jpegSize uses the standard decoder rather than trusting marker offsets.
 func jpegSize(data []byte) (int, int) {
-	i := 2
-	for i+9 < len(data) {
-		if data[i] != 0xFF {
-			i++
-			continue
-		}
-		marker := data[i+1]
-		switch marker {
-		case 0xC0, 0xC1, 0xC2, 0xC3:
-			h := int(data[i+5])<<8 | int(data[i+6])
-			w := int(data[i+7])<<8 | int(data[i+8])
-			return w, h
-		case 0xD8, 0xD9, 0x01:
-			i += 2
-		default:
-			ln := int(data[i+2])<<8 | int(data[i+3])
-			i += 2 + ln
-		}
+	config, err := jpeg.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0
 	}
-	return 0, 0
+	return config.Width, config.Height
 }
 
 func truncate(s string, n int) string {
@@ -403,10 +413,9 @@ type VisionFallbackSolver struct {
 	Manual    CaptchaSolver
 	MaxVision int // 视觉模型最大尝试次数；<=0 表示无限重试（不降级人工）
 
-	mu            sync.Mutex
-	visionCalls   int  // 视觉阶段已消耗的挑战数
-	manualPhase   bool // 是否已进入人工阶段（仅配置了上限时可达）
-	lastError     error
+	mu          sync.Mutex
+	visionCalls int  // 视觉阶段已消耗的挑战数
+	manualPhase bool // 是否已进入人工阶段（仅配置了上限时可达）
 }
 
 func NewVisionFallbackSolver(vision, manual CaptchaSolver, maxVision int) *VisionFallbackSolver {
@@ -432,36 +441,42 @@ func (s *VisionFallbackSolver) ManualPhase() bool {
 	return s.manualPhase
 }
 
+// Reset starts a new verification cycle. Service calls it while holding the
+// session gate, so a solved challenge never consumes the next cycle's budget.
+func (s *VisionFallbackSolver) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.visionCalls = 0
+	s.manualPhase = false
+}
+
 func (s *VisionFallbackSolver) Solve(ctx context.Context, ch CaptchaChallenge) (CaptchaSolution, error) {
+	if err := ctx.Err(); err != nil {
+		return CaptchaSolution{}, err
+	}
 	s.mu.Lock()
-	inManual := s.manualPhase
-	s.mu.Unlock()
-
-	// 人工阶段（仅配置了上限且已用尽时）：交给人工通道
-	if inManual {
-		return s.Manual.Solve(ctx, ch)
-	}
-
-	// 视觉阶段：无限重试（或未达上限）
-	sol, err := s.Vision.Solve(ctx, ch)
-	s.mu.Lock()
-	s.visionCalls++
-	if err != nil {
-		s.lastError = err
-	}
-	if err == nil {
-		s.lastError = nil
-		s.mu.Unlock()
-		return sol, nil
-	}
-	s.mu.Unlock()
-	// 配置了上限且已用尽 → 切换人工阶段
-	if s.MaxVision > 0 && s.visionCalls >= s.MaxVision {
-		s.mu.Lock()
+	if s.manualPhase || s.MaxVision > 0 && s.visionCalls >= s.MaxVision {
 		s.manualPhase = true
 		s.mu.Unlock()
-		log.Printf("[itdog] 视觉模型已尝试 %d 次未通过，降级人工通道（最近错误: %v）",
-			s.MaxVision, err)
+		if s.Manual == nil {
+			return CaptchaSolution{}, errors.New("manual solver 未配置")
+		}
+		return s.Manual.Solve(ctx, ch)
 	}
-	return CaptchaSolution{}, fmt.Errorf("vision 第 %d 次尝试失败: %w", s.visionCalls, err)
+	s.visionCalls++
+	attempt := s.visionCalls
+	// Count every invocation, including well-formed coordinates rejected later
+	// by the upstream verifier. The next challenge uses the manual channel.
+	if s.MaxVision > 0 && attempt >= s.MaxVision {
+		s.manualPhase = true
+	}
+	s.mu.Unlock()
+	if s.Vision == nil {
+		return CaptchaSolution{}, errors.New("vision solver 未配置")
+	}
+	sol, err := s.Vision.Solve(ctx, ch)
+	if err != nil {
+		return CaptchaSolution{}, fmt.Errorf("vision 第 %d 次尝试失败: %w", attempt, err)
+	}
+	return sol, nil
 }

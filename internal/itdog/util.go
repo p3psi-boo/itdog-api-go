@@ -78,118 +78,89 @@ func getToken(taskID string) string {
 	return s[8:24]
 }
 
+// getStatisticians counts every node, but only finite, non-negative delays
+// from successful nodes participate in min/max/average.
 func getStatisticians(entries []StatEntry) map[string]any {
-	ispStats := map[string]*statBucket{
-		"电信": emptyBucket(),
-		"移动": emptyBucket(),
-		"联通": emptyBucket(),
-		"境外": emptyBucket(),
+	buckets := map[string]*statBucket{}
+	for _, name := range []string{"全部", "境内", "境外", "电信", "联通", "移动"} {
+		buckets[name] = &statBucket{}
 	}
-	regionStats := map[string]*statBucket{}
 	for _, name := range regionData {
-		regionStats[name] = emptyBucket()
+		buckets[name] = &statBucket{}
 	}
-	china := emptyBucket()
-	abroad := emptyBucket()
-	all := emptyBucket()
-
 	for _, e := range entries {
-		num := e.Delay
-		all.Nodes++
-		all.All += num
-		if all.Fast.Delay == 0 || num < all.Fast.Delay {
-			all.Fast.Delay += num
-			all.Fast.Name = e.Name
-		}
-		if all.Slow.Delay == 0 || num > all.Slow.Delay {
-			all.Slow.Delay += num
-			all.Slow.Name = e.Name
-		}
-
-		if isp, ok := ispData[e.Line]; ok {
-			s := ispStats[isp]
-			s.Nodes++
-			s.All += num
-			if s.Fast.Delay == 0 || num < s.Fast.Delay {
-				s.Fast.Delay += num
-				s.Fast.Name = e.Name
-			}
-			if s.Slow.Delay == 0 || num > s.Slow.Delay {
-				s.Slow.Delay += num
-				s.Slow.Name = e.Name
-			}
-		}
-
-		province := provinceData[e.Province]
-		region := regionData[e.Region]
-		if province == "境外" || region == "境外" {
-			abroad.Nodes++
-			abroad.All += num
-			if abroad.Fast.Delay == 0 || num < abroad.Fast.Delay {
-				abroad.Fast.Delay = num
-				abroad.Fast.Name = e.Name
-			}
-			if abroad.Slow.Delay == 0 || num > abroad.Slow.Delay {
-				abroad.Slow.Delay = num
-				abroad.Slow.Name = e.Name
-			}
+		names := []string{"全部"}
+		// Keep the geographic overseas bucket separate from ISP classification.
+		if e.Province == 99 || e.Line == 5 || e.Region >= 9 {
+			names = append(names, "境外")
 		} else {
-			china.Nodes++
-			china.All += num
-			if china.Fast.Delay == 0 || num < china.Fast.Delay {
-				china.Fast.Delay = num
-				china.Fast.Name = e.Name
-			}
-			if china.Slow.Delay == 0 || num > china.Slow.Delay {
-				china.Slow.Delay = num
-				china.Slow.Name = e.Name
-			}
+			names = append(names, "境内")
 		}
-
-		if region != "" {
-			s := regionStats[region]
-			s.Nodes++
-			s.All += num
-			if s.Fast.Delay == 0 || num < s.Fast.Delay {
-				s.Fast.Delay += num
-				s.Fast.Name = e.Name
-			}
-			if s.Slow.Delay == 0 || num > s.Slow.Delay {
-				s.Slow.Delay += num
-				s.Slow.Name = e.Name
-			}
+		if isp, ok := ispData[e.Line]; ok && isp != "境外" {
+			names = append(names, isp)
+		}
+		if region := regionData[e.Region]; region != "" {
+			names = append(names, region)
+		}
+		for _, name := range names {
+			buckets[name].add(e)
 		}
 	}
-
-	if all.All == 0 {
-		if all.Nodes == 0 {
-			all.Argv = "NaN"
-		} else {
-			all.Argv = "Infinity"
+	out := make(map[string]any, len(buckets))
+	for name, bucket := range buckets {
+		if bucket.Success > 0 {
+			bucket.Avg = fmt.Sprintf("%.2f", bucket.All/float64(bucket.Success))
+			bucket.Argv = bucket.Avg // Deprecated compatibility alias.
 		}
-	} else {
-		all.Argv = fmt.Sprintf("%.2f", float64(all.Nodes)/all.All)
-	}
-
-	out := map[string]any{
-		"境内": china,
-		"境外": abroad,
-		"全部": all,
-	}
-	for k, v := range ispStats {
-		out[k] = v
-	}
-	for k, v := range regionStats {
-		out[k] = v
+		out[name] = bucket
 	}
 	return out
 }
 
-func emptyBucket() *statBucket {
-	return &statBucket{
-		Fast: delayName{},
-		Slow: delayName{},
+func (b *statBucket) add(e StatEntry) {
+	b.Nodes++
+	if e.Failed || e.Delay < 0 || math.IsNaN(e.Delay) || math.IsInf(e.Delay, 0) {
+		b.Failed++
+		return
 	}
+	b.Success++
+	b.All += e.Delay
+	if b.Success == 1 || e.Delay < b.Fast.Delay {
+		b.Fast = delayName{Name: e.Name, Delay: e.Delay}
+	}
+	if b.Success == 1 || e.Delay > b.Slow.Delay {
+		b.Slow = delayName{Name: e.Name, Delay: e.Delay}
+	}
+}
+
+// nodeDelay preserves failure instead of silently interpreting missing data as 0ms.
+func nodeDelay(m map[string]any, field string) (float64, bool) {
+	if kind := stringFrom(m["type"]); kind != "" && kind != "success" {
+		return -1, false
+	}
+	v, exists := m[field]
+	if !exists || v == nil {
+		return -1, false
+	}
+	var n float64
+	switch x := v.(type) {
+	case float64:
+		n = x
+	case int:
+		n = float64(x)
+	case string:
+		var err error
+		n, err = strconv.ParseFloat(x, 64)
+		if err != nil {
+			return -1, false
+		}
+	default:
+		return -1, false
+	}
+	if n < 0 || math.IsNaN(n) || math.IsInf(n, 0) {
+		return -1, false
+	}
+	return n, true
 }
 
 func numberFromAny(v any) float64 {

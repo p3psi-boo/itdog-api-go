@@ -2,14 +2,19 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
-	"net"
 	"net/http"
-	"net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -35,10 +40,25 @@ type captchaProvider interface {
 	Captcha() *itdog.CaptchaBroker
 }
 
-func NewRouter(svc service) *gin.Engine {
+type RouterOption func(*routerConfig)
+type routerConfig struct{ requestTimeout time.Duration }
+
+func WithRequestTimeout(timeout time.Duration) RouterOption {
+	return func(c *routerConfig) {
+		if timeout > 0 {
+			c.requestTimeout = timeout
+		}
+	}
+}
+
+func NewRouter(svc service, opts ...RouterOption) *gin.Engine {
+	config := routerConfig{requestTimeout: 17 * time.Minute}
+	for _, opt := range opts {
+		opt(&config)
+	}
 	g := gin.New()
-	g.Use(recoveryWrapper())
-	g.Use(requestLogger())
+	g.HandleMethodNotAllowed = true
+	g.Use(requestLogger(), recoveryWrapper(), requestLimits(config.requestTimeout))
 	g.NoRoute(func(c *gin.Context) { fail(c, http.StatusNotFound, "Not Found") })
 	g.NoMethod(func(c *gin.Context) { fail(c, http.StatusMethodNotAllowed, "Method Not Allowed") })
 
@@ -66,18 +86,85 @@ func recoveryWrapper() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
 			if r := recover(); r != nil {
-				fail(c, http.StatusInternalServerError, "Internal Server Error")
+				log.Printf("request_id=%s panic_type=%T stack=%s", c.GetString("request_id"), r, debug.Stack())
+				if !c.Writer.Written() {
+					fail(c, http.StatusInternalServerError, "Internal Server Error")
+				} else {
+					c.Abort()
+				}
 			}
 		}()
 		c.Next()
 	}
 }
 
+var requestSequence atomic.Uint64
+
 func requestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		log.Printf("[%s] %s - %s", c.Request.Method, c.Request.URL.String(), c.GetHeader("User-Agent"))
+		start := time.Now()
+		id := fmt.Sprintf("%x-%x", start.UnixNano(), requestSequence.Add(1))
+		c.Set("request_id", id)
+		c.Header("X-Request-ID", id)
+		defer func() {
+			// Query strings, headers, bodies and panic values may contain credentials.
+			log.Printf("request_id=%s method=%s path=%q status=%d duration=%s", id, c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(start))
+		}()
 		c.Next()
 	}
+}
+
+func requestLimits(timeout time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 128<<10)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+}
+
+func bindJSON(c *gin.Context, value any) bool {
+	decoder := json.NewDecoder(c.Request.Body)
+	err := decoder.Decode(value)
+	if err == nil {
+		var extra any
+		err = decoder.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		if err == nil {
+			err = errors.New("只接受一个 JSON 对象")
+		}
+	}
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			fail(c, http.StatusRequestEntityTooLarge, "请求体过大")
+		} else {
+			fail(c, http.StatusBadRequest, "无效的 JSON 请求")
+		}
+		return false
+	}
+	return true
+}
+
+func serviceFailure(c *gin.Context, data map[string]any, err error) {
+	code := http.StatusBadGateway
+	switch {
+	case errors.Is(err, itdog.ErrQueueFull), errors.Is(err, itdog.ErrQueueTimeout):
+		code = http.StatusServiceUnavailable
+		c.Header("Retry-After", "1")
+	case errors.Is(err, context.DeadlineExceeded):
+		code = http.StatusGatewayTimeout
+	case errors.Is(err, context.Canceled):
+		code = 499
+	}
+	envelope := gin.H{"code": code, "timestamp": time.Now().UnixMilli(), "message": err.Error()}
+	if data != nil {
+		envelope["data"] = data
+	}
+	c.AbortWithStatusJSON(code, envelope)
 }
 
 func (a *API) ping(c *gin.Context) {
@@ -92,7 +179,7 @@ func (a *API) ping(c *gin.Context) {
 	}
 	data, err := a.svc.Ping(c.Request.Context(), host)
 	if err != nil {
-		fail(c, http.StatusBadGateway, err.Error())
+		serviceFailure(c, data, err)
 		return
 	}
 	success(c, data)
@@ -112,7 +199,7 @@ func (a *API) tcping(c *gin.Context) {
 	}
 	data, err := a.svc.TCPing(c.Request.Context(), host, port)
 	if err != nil {
-		fail(c, http.StatusBadGateway, err.Error())
+		serviceFailure(c, data, err)
 		return
 	}
 	success(c, data)
@@ -120,8 +207,7 @@ func (a *API) tcping(c *gin.Context) {
 
 func (a *API) httpCheck(c *gin.Context) {
 	var req itdog.HTTPOptions
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, "无效的请求链接！")
+	if !bindJSON(c, &req) {
 		return
 	}
 	if !validURL(req.URL) {
@@ -134,9 +220,13 @@ func (a *API) httpCheck(c *gin.Context) {
 		return
 	}
 	req.Method = method
+	if err := validateHTTPOptions(req); err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	data, err := a.svc.HTTP(c.Request.Context(), req)
 	if err != nil {
-		fail(c, http.StatusBadGateway, err.Error())
+		serviceFailure(c, data, err)
 		return
 	}
 	success(c, data)
@@ -150,7 +240,7 @@ func (a *API) dns(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "不正确的主机名或IPV4地址！")
 		return
 	}
-	if !validHost(domain) {
+	if !validDNSName(domain) {
 		fail(c, http.StatusBadRequest, "不正确的主机名或IPV4地址！")
 		return
 	}
@@ -158,29 +248,16 @@ func (a *API) dns(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "无效的解析类型！")
 		return
 	}
+	if !validDNSServer(server) {
+		fail(c, http.StatusBadRequest, "无效的 DNS 服务器！")
+		return
+	}
 	data, err := a.svc.DNS(c.Request.Context(), domain, dnsType, server)
 	if err != nil {
-		fail(c, http.StatusBadGateway, err.Error())
+		serviceFailure(c, data, err)
 		return
 	}
 	success(c, data)
-}
-
-func validHost(host string) bool {
-	ip := net.ParseIP(host)
-	if ip != nil && ip.To4() != nil {
-		return true
-	}
-	addrs, err := net.LookupIP(host)
-	return err == nil && len(addrs) > 0
-}
-
-func validURL(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	return u.Scheme != "" && u.Host != ""
 }
 
 func validDNSType(v string) bool {
@@ -201,6 +278,14 @@ func (a *API) captchaPage(c *gin.Context) {
 		fail(c, http.StatusForbidden, "令牌错误")
 		return
 	}
+	c.Header("Cache-Control", "no-store")
+	c.Header("Referrer-Policy", "no-referrer")
+	if a.captchaToken != "" {
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name: "itdog_captcha_token", Value: a.captchaToken, Path: "/it/captcha",
+			HttpOnly: true, Secure: c.Request.TLS != nil, SameSite: http.SameSiteStrictMode,
+		})
+	}
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(captchaHTML))
 }
 
@@ -213,6 +298,7 @@ func (a *API) captchaStatus(c *gin.Context) {
 		fail(c, http.StatusNotFound, "验证码服务未启用")
 		return
 	}
+	c.Header("Cache-Control", "no-store")
 	ch, version, ok := a.broker.Pending()
 	if !ok {
 		success(c, gin.H{"pending": false})
@@ -241,7 +327,10 @@ func (a *API) captchaSubmit(c *gin.Context) {
 		Points  [][2]int `json:"points"`
 		Version int64    `json:"version"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || len(req.Points) != 2 {
+	if !bindJSON(c, &req) {
+		return
+	}
+	if len(req.Points) != 2 {
 		fail(c, http.StatusBadRequest, "需要两个点击坐标！")
 		return
 	}
@@ -265,7 +354,10 @@ func (a *API) captchaAllowed(c *gin.Context) bool {
 	if tok == "" {
 		tok = c.GetHeader("X-Captcha-Token")
 	}
-	return tok == a.captchaToken
+	if tok == "" {
+		tok, _ = c.Cookie("itdog_captcha_token")
+	}
+	return subtle.ConstantTimeCompare([]byte(tok), []byte(a.captchaToken)) == 1
 }
 
 const captchaHTML = `<!doctype html>
@@ -274,7 +366,7 @@ const captchaHTML = `<!doctype html>
 body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;padding:24px;color:#222}
 .wrap{max-width:420px;margin:0 auto;background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
 h1{font-size:17px;margin:0 0 4px}.tip{color:#888;font-size:13px;margin-bottom:12px}
-#imgoxed{position:relative;line-height:0;cursor:crosshair;border:1px solid #ddd;border-radius:6px;overflow:hidden}
+#imgbox{position:relative;line-height:0;cursor:crosshair;border:1px solid #ddd;border-radius:6px;overflow:hidden}
 #imgbox img{width:100%;display:block}
 .dot{position:absolute;width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;background:rgba(229,72,77,.85);color:#fff;font-size:12px;line-height:18px;text-align:center;transform:scale(var(--s,1))}
 button{margin-top:14px;width:100%;padding:11px;border:0;border-radius:8px;background:#2f6fed;color:#fff;font-size:15px;cursor:pointer}
@@ -290,11 +382,11 @@ button:disabled{background:#b7c4e4}
 </div><script>
 var pts=[];var cur=null;
 var TOK=new URLSearchParams(location.search).get('token')||'';
-function tq(){return TOK?'?token='+encodeURIComponent(TOK):''}
+if(TOK){var clean=new URL(location.href);clean.searchParams.delete('token');history.replaceState(null,'',clean.pathname+clean.search+clean.hash)}
 function th(){return TOK?{'X-Captcha-Token':TOK}:{}}
 function setStatus(t){document.getElementById('status').textContent=t}
 function load(){
-  fetch('/it/captcha/status'+tq()).then(function(r){return r.json()}).then(function(j){
+  fetch('/it/captcha/status',{headers:th()}).then(function(r){return r.json()}).then(function(j){
     if(j.code!==200){document.getElementById('msg').textContent=j.message||'加载失败';return}
     var d=j.data;
     if(!d.pending){cur=null;pts=[];document.getElementById('img').removeAttribute('src');document.getElementById('msg').textContent='当前没有需要处理的验证码';document.getElementById('submit').disabled=true;setStatus('等待中…页面会自动刷新');setTimeout(load,3000);return}
@@ -347,7 +439,7 @@ func success(c *gin.Context, data any) {
 }
 
 func fail(c *gin.Context, code int, message string) {
-	c.JSON(http.StatusOK, gin.H{
+	c.AbortWithStatusJSON(code, gin.H{
 		"code":      code,
 		"timestamp": time.Now().UnixMilli(),
 		"message":   message,

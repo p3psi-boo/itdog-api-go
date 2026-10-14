@@ -55,6 +55,7 @@ type StatEntry struct {
 	Province int
 	Name     string
 	Delay    float64
+	Failed   bool
 }
 
 type delayName struct {
@@ -63,9 +64,12 @@ type delayName struct {
 }
 
 type statBucket struct {
-	Nodes int       `json:"nodes"`
-	All   float64   `json:"all"`
-	Argv  string    `json:"argv,omitempty"`
-	Fast  delayName `json:"fast"`
-	Slow  delayName `json:"slow"`
+	Nodes   int       `json:"nodes"`
+	Success int       `json:"success"`
+	Failed  int       `json:"failed"`
+	Avg     string    `json:"avg"`
+	All     float64   `json:"all"`
+	Argv    string    `json:"argv,omitempty"`
+	Fast    delayName `json:"fast"`
+	Slow    delayName `json:"slow"`
 }
